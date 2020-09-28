@@ -1,0 +1,427 @@
+---
+title: "Example of PMM Aggregation"
+author: "Niklas Dreiner"
+date: "21.4.2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE )
+```
+
+
+## Imports
+
+```{r dependencies}
+##Datasets
+require(mlbench) # to load example datasets from
+require(titanic) # to load example datasets
+
+#Model functions
+require(xgboost) # xgboost modeler as an example
+
+
+#Aggregation Functions
+source("functionDefinitionsPMM.R")
+```
+
+## Generating the example dataset
+
+We will simulate a multilabel dataset with differing amount of true labels and dependencies within two steps:
+ * columnwise appending of multiple binary example datasets
+ * to simulate inter-label dependencies, artifical labels dependent on logical connections between the other labels are added
+
+```{r datasetGenerationStep1}
+#titanic dataset
+data(titanic_train)
+df_titanic <- sample(titanic_train)
+#Wisconsin breast cancer
+data(BreastCancer)
+df_wisconsinBreastcancer<-sample(BreastCancer)
+#Pima Indians Diabetes Database
+data(PimaIndiansDiabetes)
+df_PimaIndiansDiabetes <- sample(PimaIndiansDiabetes)
+# Sonar Database
+data(Sonar)
+df_Sonar <- sample(Sonar)
+
+
+#unify data
+n_shared_rows <- min(nrow(df_titanic),
+                nrow(df_wisconsinBreastcancer),
+                nrow(df_PimaIndiansDiabetes),
+                nrow(df_Sonar))
+df_total<-list(df_titanic,df_wisconsinBreastcancer,df_PimaIndiansDiabetes,df_Sonar)
+df_total<-lapply(df_total, function(x){return(x[c(1:n_shared_rows),])})
+df_total<-bind_cols(df_total)
+#extract the labels and delete labels from dataset
+c_lab_titanic <-(df_total[["Survived"]]==1)
+c_lab_bc <- (df_total[["Class"]] =="malignant")
+c_lab_pimaD <- (df_total[["diabetes"]]=="pos")
+c_lab_sonar <- (df_total[["Class1"]]=="R")
+df_total[,c("Survived","Class","diabetes","Class1")]<-list(NULL)
+df_labels <- data.frame( SurvivedTitanic = c_lab_titanic,
+                         HasBreastCancer = c_lab_bc,
+                         HasDiabetes = c_lab_pimaD,
+                         IsRock = c_lab_sonar
+                         )
+#add artifical labels in to simulate dependencies
+df_labels$SurvivedTitanicANDHasBreastCancer<-df_labels$SurvivedTitanic & df_labels$HasBreastCancer
+df_labels$SurvivedTitanicORHasBreastCancer<-df_labels$SurvivedTitanic | df_labels$HasBreastCancer
+df_labels$SurvivedTitanicXORHasBreastCancer<-xor(df_labels$SurvivedTitanic,df_labels$HasBreastCancer)
+df_labels$allNegative <-!(df_labels$SurvivedTitanic | df_labels$HasBreastCancer |df_labels$HasDiabetes |df_labels$IsRock)
+df_labels$HasNoDiabetes <- !(df_labels$HasDiabetes)
+#add random noise
+df_labels$random_fifty_p_true <- sample(c(T,F),nrow(df_labels), replace = T)
+df_labels$random_thirty_p_true <-sample(c(T,F),prob=c(0.3,0.7),nrow(df_labels), replace = T)
+df_labels$random_ten_p_true <- sample(c(T,F),prob=c(0.1,0.9),nrow(df_labels), replace = T)
+
+#delete Id columns
+df_total[,c("Name","Cabin","PassengerId","Id","Ticket")]<-list(NULL)
+#make char to factor
+df_total$Embarked <- as.factor(df_total$Embarked)
+df_total$Sex <- as.factor(df_total$Sex )
+head(df_total)
+```
+
+```{r label_overview}
+head(df_labels)
+```
+
+
+
+## Train model
+```{r Traintestsplit}
+p_testset<- 0.3
+y_in_testset<-sample(c(T,F),size= nrow(df_total),prob = c(p_testset,1-p_testset),replace = T)
+x_train<-df_total[!y_in_testset,]
+x_test<-df_total[y_in_testset,]
+y_train<- df_labels[!y_in_testset,]
+y_test<-  df_labels[y_in_testset,]
+
+```
+
+```{r train}
+model<- pmmAggregation(df_labels=y_train,
+                          data = data.matrix(x_train),
+                          indiv_model_function=xgboost,
+                          indiv_model_function_args=list(data=data.matrix(x_train),nrounds=2,params=list(eta=0.5,gamma=4,max_depth=10),verbose=0),
+                          indiv_label_argName="label",
+                          indiv_prediction_function=predict,
+                          indiv_prediction_args=NULL,
+                          indpred_arg_name_modelobj="object",
+                          indpred_arg_name_newdata="newdata",
+                          .progress="time",
+                          .parallel=F
+)
+
+
+
+```
+
+```{r}
+head(model$df_predictions)
+```
+```{r made_AUC}
+model$vec_AUC
+
+
+```
+
+```{r vecWeight}
+model$vec_W
+```
+
+We can return a prediction in a form of matrix, or in a form of a nearest neighbour dataframe
+
+```{r predict_knn}
+#NOTE:
+#right now, the prediction  can handle only matrix like input
+#return prediction matrix
+df_prediction_matrix <-predict.pmmAggregation(model,data.matrix(x_test),k=1000,str_returnType = "m_pred")
+df_prediction_knn <-predict.pmmAggregation(model,data.matrix(x_test),k=1000,str_returnType = "knn",y_include_distances=T)
+
+
+
+```
+
+```{r}
+head(df_prediction_matrix)
+```
+
+Let us see how many of those predictions are illogical.
+
+```{r check_illogicals}
+#tranndformatrion of the prediction matrix containing p(TRUE) to bool values
+df_prediction_matrix_bool <- as.data.frame(apply(df_prediction_matrix,c(1,2),function(x){return(x>=0.5)}))
+ls_y_Islogical<-list()
+ls_y_Islogical[[1]] <- (df_prediction_matrix_bool$SurvivedTitanic & df_prediction_matrix_bool$HasBreastCancer) == df_prediction_matrix_bool$SurvivedTitanicANDHasBreastCancer
+ls_y_Islogical[[2]] <- (df_prediction_matrix_bool$SurvivedTitanic | df_prediction_matrix_bool$HasBreastCancer) == df_prediction_matrix_bool$SurvivedTitanicORHasBreastCancer
+ls_y_Islogical[[3]]<- xor(df_prediction_matrix_bool$SurvivedTitanic,df_prediction_matrix_bool$HasBreastCancer) == df_prediction_matrix_bool$SurvivedTitanicXORHasBreastCancer
+ls_y_Islogical[[4]] <- (df_prediction_matrix_bool$HasDiabetes=!df_prediction_matrix_bool$HasNoDiabetes)
+ls_y_Islogical[[5]]<-!(df_prediction_matrix_bool$SurvivedTitanic | df_prediction_matrix_bool$HasBreastCancer |df_prediction_matrix_bool$HasDiabetes |df_prediction_matrix_bool$IsRock) == df_prediction_matrix_bool$allNegative
+table(unlist(ls_y_Islogical))
+```
+As we can see there are illogical statements made by the raw prediction, when each classifier classifies the dimensions independently. `r table(unlist(ls_y_Islogical))[[1]]/length(unlist(ls_y_Islogical))*100` % of the predicted interdependent labels are in conflict with another label of the description. This could be for example when the classifier predicts that the patient has Diabetes and Has Not Diabetes at the same time.
+
+pmm.Aggregation tries to alleviate this problem. It tries to find instances in its training data model_object\$df_labels, in ehich ist predicted similar values to the current prediction. This is done by a lookup in model_object\$df_predictions. It displays these results in form of a dataframe:
+
+```{r}
+head(df_prediction_knn)
+```
+
+
+## Evaluate the model
+```{r}
+#evaluate.pmmAggregation(model,testing_predictions= df_prediction_matrix ,k=1000,str_returnType = "m_pred"),testing_df_label = y_test)
+eval <-evaluate.pmmAggregation(model,testing_predictions= predict.pmmAggregation(model,data.matrix(x_test),k=1000,str_returnType = "m_pred"),testing_df_label = y_test)
+eval
+
+```
+
+```{r plot}
+
+evalplot1<-gather(eval,key="type_t_value", value="t_value",-k)
+ggplot(evalplot1,aes(x=k,y=t_value,color=type_t_value))+geom_line()
+
+
+```
+
+```{r best_vec_W}
+WEIGHT_P_TO_TRY <-c(0,1.2,1:8,10,20)
+df_comparison_p <-llply(WEIGHT_P_TO_TRY,
+                        .fun =function(x){
+                          model<- pmmAggregation(df_labels=y_train,
+                                                 data = data.matrix(x_train),
+                                                 p=x,
+                                                 indiv_model_function=xgboost,
+                                                 indiv_model_function_args=list(data=data.matrix(x_train),
+                                                                                nrounds=2,
+                                                                                params=list(eta=0.5,
+                                                                                            gamma=4,
+                                                                                            max_depth=10),
+                                                                                verbose=0),
+                                                 indiv_label_argName="label",
+                                                 indiv_prediction_function=predict,
+                                                 indiv_prediction_args=NULL,
+                                                 indpred_arg_name_modelobj="object",
+                                                 indpred_arg_name_newdata="newdata",
+                                                 .progress="none",
+                                                 .parallel=F
+                          )
+                          result<-evaluate.pmmAggregation(model,
+                                                          predict.pmmAggregation(model,
+                                                                                 data.matrix(x_test),
+                                                                                 str_returnType = "m_pred"
+                                                                                 ),
+                                                          y_test)
+                          result$p_of_weighting<-x
+                          return(result)
+                        },
+                        .progress="time"
+)
+df_comparison_p<- bind_rows(df_comparison_p)
+
+eval_pplot<-df_comparison_p[c("k","p_of_weighting","t_value")]
+eval_pplot$p_of_weighting<-as.factor(eval_pplot$p_of_weighting)
+ggplot(eval_pplot,aes(x=k,y=t_value,color=p_of_weighting))+geom_line()
+```
+
+This is slower than needed. As we only need to manipulate the distance calculation, an update of the weights vector is sufficient. We do not need to retrain the model itself. This is done using the function `update_weights`.
+
+```{r fast_p_update}
+model_fast<- pmmAggregation(df_labels=y_train,
+                                                 data = data.matrix(x_train),
+                                                 p=2,
+                                                 indiv_model_function=xgboost,
+                                                 indiv_model_function_args=list(data=data.matrix(x_train),
+                                                                                nrounds=2,
+                                                                                params=list(eta=0.5,
+                                                                                            gamma=4,
+                                                                                            max_depth=10),
+                                                                                verbose=0),
+                                                 indiv_label_argName="label",
+                                                 indiv_prediction_function=predict,
+                                                 indiv_prediction_args=NULL,
+                                                 indpred_arg_name_modelobj="object",
+                                                 indpred_arg_name_newdata="newdata",
+                                                 .progress="none",
+                                                 .parallel=F
+                          )
+df_comparison_p <-llply(WEIGHT_P_TO_TRY,
+                        .fun =function(x){
+                          model_fast<-update_weights(model = model_fast,p=x)
+                          result<-evaluate.pmmAggregation(model_fast,
+                                                          predict.pmmAggregation(model_fast,
+                                                                                 data.matrix(x_test),
+                                                                                 str_returnType = "m_pred"),
+                                                          y_test)
+                          result$p_of_weighting<-x
+                          return(result)
+                        },
+                        .progress="time"
+)
+df_comparison_p<- bind_rows(df_comparison_p)
+
+eval_pplot_fast<-df_comparison_p[c("k","p_of_weighting","t_value")]
+eval_pplot_fast$p_of_weighting<-as.factor(eval_pplot_fast$p_of_weighting)
+ggplot(eval_pplot_fast,aes(x=k,y=t_value,color=p_of_weighting))+geom_line()
+
+```
+
+
+
+### Custom models and functions
+
+PMM Aggregation accepts any model under the following conditions:
+
+* The model can classify binary $label \in {TRUE, FALSE}$ to be evaluated via AUC.
+* the output of the prediction function is the probability of the label being True : $p(IsTrue)$
+* Output of the training model can have the following output:
+  + model_object
+  + `list(model=model_object, AUC= .auc_calculated)`: In this Case, the AUC value provided will be the AUC value given to the weight calculation concerning this label dimension.
+
+
+The following Code is an example of a custom training function:
+The function adds cv as well as gridsearch to the xgboost training
+
+
+```{r manipulating_train_function}
+#enabling xgboost with cv, gridsearch and automatic AUC Control as example for a custom train function usable with pmm.Aggregation
+custom_xgboost<-function(train_data,
+                         custom_label_arg_name,
+                         grid_xgb,cv_folds,
+                         nrounds){
+  ls_params_performance<-apply(grid_xgb,1,function(params){
+                        current_params=list(eta=params[['eta']],
+                        max_depth=params[['max_depth']],
+                        gamma=params[['gamma']],
+                        colsample_bytree=params[['colsample_bytree']],
+                        subsample=params[['subsample']]
+    )
+    
+    xgboost_cv<-xgb.cv(data=train_data,
+                       label=custom_label_arg_name,
+                       objective="binary:logistic",
+                       nfold = cv_folds,
+                       nrounds = nrounds,
+                       params = current_params,
+                       metrics= "auc",
+                       stratified = T,
+                       verbose=F
+    )
+    eval_log <-xgboost_cv$evaluation_log
+    eval_log <- eval_log %>% arrange(desc(test_auc_mean))
+    result_auc<-eval_log$test_auc_mean[1]
+    best_iteration_number <- eval_log$iter[1]
+    return(list(result_auc=result_auc,best_iteration_number=best_iteration_number,params=current_params))
+  }
+  )
+  #get best params
+  ls_unlistet_auc <- lapply(ls_params_performance,'[[',"result_auc") #extract result_auc
+  ls_unlistet_auc <- unlist(ls_unlistet_auc)#make to vector
+  index_best_params<-which(ls_unlistet_auc==max(ls_unlistet_auc))[1]
+  #train final on the whole train set with the best parameters
+  result_model<-xgboost(data=train_data,
+                       label=custom_label_arg_name,
+                       objective="binary:logistic",
+                       nrounds = ls_params_performance[[index_best_params]]$best_iteration_number,
+                       params = ls_params_performance[[index_best_params]]$params,
+                       verbose = F)
+  #Return statement: IMPORTANT, names and order of the list are extremly important to pmm.Aggregation
+  return(list(model=result_model,
+              AUC=ls_unlistet_auc[index_best_params])
+         )
+}
+
+
+
+```
+
+
+```{r in_pmm_aggregate, message=FALSE}
+gridsearch_table <- expand.grid(eta=c(0.1,0.3),
+                               max_depth=c(3,6),
+                               gamma=c(1,5),
+                               colsample_bytree=c(0.5,1),
+                               subsample=c(0.8,1))
+
+aggregated_model <- pmmAggregation(df_labels=y_train,
+                                   data = data.matrix(x_train),
+                                   p=2,
+                                   indiv_model_function=custom_xgboost,
+                                   indiv_model_function_args=list(train_data=data.matrix(x_train),
+                                                                  cv_folds=2,
+                                                                  nrounds=10,
+                                                                  grid_xgb=gridsearch_table
+                                                                  ),
+                                   indiv_label_argName="custom_label_arg_name",
+                                   indiv_prediction_function=predict,
+                                   indiv_prediction_args=NULL,
+                                   indpred_arg_name_modelobj="object",
+                                   indpred_arg_name_newdata="newdata",
+                                   .progress="time",
+                                   .parallel=F
+)
+
+
+
+
+```
+```{r}
+eval <-evaluate.pmmAggregation(aggregated_model,
+                               testing_predictions= predict.pmmAggregation(aggregated_model,data.matrix(x_test),str_returnType = "m_pred"),
+                               testing_df_label = y_test)
+evalplot2<-gather(eval,key="type_t_value", value="t_value",-k) %>% rbind(.,filter(evalplot1,type_t_value=="t_value") %>% mutate(.,type_t_value="old_t_value"))
+ggplot(evalplot2,aes(x=k,y=t_value,color=type_t_value))+geom_line()
+```
+
+To demonstrate a Model other than  xgboost, we will use logistic regression as an alternative.
+
+```{r}
+
+
+
+#glm is a bit of a pain as it forces usage of a formula. glm.fit(x,y) will break at prediction)
+glm_custom<-function(x,y){
+  label <- y
+  data <- cbind(x,label)
+  data <- as.data.frame(data.matrix(data))
+  glm_model<-glm(formula=label~.,data=data,family = "binomial", y=F,model = F)
+  return(glm_model)
+}
+
+glm_predict <- function(model_object,x){
+  data <-as.data.frame(data.matrix(x))
+  result<-predict.glm(object=model_object,newdata=data, type="response")
+  return(result)
+}
+
+```
+
+```{r}
+#logreg cannot handle na values. We will delete all rows in the dataset with an NA Entry
+train_row_NoNA <- apply(x_train,1,FUN = function(x){all(!is.na(x))})
+aggregated_model_logreg <- pmmAggregation(df_labels=y_train[train_row_NoNA,],
+                                   data = x_train[train_row_NoNA,],
+                                   indiv_model_function=glm_custom,
+                                   indiv_model_function_args=list(x=x_train[train_row_NoNA,]),
+                                   indiv_label_argName="y",
+                                   indiv_prediction_function=glm_predict,
+                                   indiv_prediction_args=NULL,
+                                   indpred_arg_name_modelobj="model_object",
+                                   indpred_arg_name_newdata="x",
+                                   .progress="time",
+                                   .parallel=F
+)
+```
+```{r}
+test_row_NoNA <-apply(x_test,1,FUN = function(x){all(!is.na(x))})
+eval <-evaluate.pmmAggregation(aggregated_model_logreg,
+                               testing_predictions= predict.pmmAggregation(aggregated_model_logreg,x_test[test_row_NoNA,],str_returnType = "m_pred"),
+                               testing_df_label = y_test[test_row_NoNA,])
+evalplot3<-gather(eval,key="type_t_value", value="t_value",-k) %>% rbind(.,filter(evalplot1,type_t_value=="t_value") %>% mutate(.,type_t_value="old_t_value"))
+ggplot(evalplot3,aes(x=k,y=t_value,color=type_t_value))+geom_line()
+```
+
+Here we can see a problem concerning the evaluation. The evaluation cannot compare knn, where the amount of points in model\$df_prediction differs from each other.
